@@ -105,6 +105,7 @@ jobs:
 
   build-desktop:
     name: Build Desktop App - ${{ matrix.platform }}
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -209,7 +210,7 @@ jobs:
           retention-days: 7
 
   create-release:
-    needs: [build-and-push, build-desktop]
+    needs: [build-and-push]
     runs-on: ubuntu-latest
     permissions:
       contents: write

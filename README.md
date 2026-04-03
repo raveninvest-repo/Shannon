@@ -143,9 +143,12 @@ Tasks are automatically routed based on complexity:
 | Strategy | Trigger | Use Case |
 |----------|---------|----------|
 | **Simple** | Complexity < 0.3 | Single-agent, direct response |
-| **DAG** | Parallel subtasks | Fan-out/fan-in execution |
+| **DAG** | Multi-step tasks (default) | Fan-out/fan-in with dependency tracking |
 | **ReAct** | Iterative reasoning | Reasoning + tool use loops |
 | **Research** | Multi-step research | Tiered models for cost optimization (50-70% reduction) |
+| **Exploratory** | Tree-of-Thoughts | Parallel hypothesis exploration |
+| **Browser Use** | Web interaction tasks | Playwright-backed browsing agent |
+| **Domain Analysis** | Specialized analysis | Domain-specific deep research |
 | **Swarm** | Autonomous teams | Lead-orchestrated multi-agent with convergence detection |
 
 ## Core Capabilities
@@ -178,13 +181,17 @@ curl -X POST http://localhost:8080/api/v1/tasks \
   -d '{"query": "Review the auth module", "skill": "code-review", "session_id": "review-123"}'
 ```
 
-Create custom skills in `config/skills/user/`. See [Skills System](docs/skills-system.md).
+Create custom skills in `config/skills/user/` (create the directory if it doesn't exist — it's gitignored). See [Skills System](docs/skills-system.md).
 
 ### Human-in-the-Loop Approval
+
+Enable approval gates via OPA policy or workflow templates with `require_approval: true`. Approvals route to connected daemon clients via WebSocket.
+
 ```bash
-curl -X POST http://localhost:8080/api/v1/tasks \
+# Submit an approval decision
+curl -X POST http://localhost:8080/api/v1/approvals/decision \
   -H "Content-Type: application/json" \
-  -d '{"query": "Update the database schema", "context": {"require_approval": true}}'
+  -d '{"workflow_id": "<workflow_id>", "approval_id": "<approval_id>", "approved": true}'
 ```
 
 ### Session Continuity
@@ -211,7 +218,7 @@ curl -X POST http://localhost:8080/api/v1/tasks \
   -H "Content-Type: application/json" \
   -d '{
     "query": "Generate a market report",
-    "config": {"budget": {"max_tokens": 5000, "fallback_model": "gpt-5-mini"}}
+    "context": {"budget_max": 5000}
   }'
 ```
 
@@ -224,9 +231,10 @@ curl -X POST http://localhost:8080/api/v1/tasks \
 - **Anthropic**: Claude Opus 4.6, Sonnet 4.6, Haiku 4.5
 - **OpenAI**: GPT-5.1, GPT-5 mini, GPT-5 nano
 - **Google**: Gemini 2.5 Pro, Gemini 2.5 Flash, Gemini 3 Pro Preview
-- **xAI**: Grok 4 (reasoning & non-reasoning)
+- **xAI**: Grok 4 (reasoning & non-reasoning), Grok 3 Mini
 - **DeepSeek**: DeepSeek Chat, DeepSeek Reasoner
 - **MiniMax**: M2.7, M2.7-highspeed
+- **Groq**: Llama, Mixtral (ultra-fast inference)
 - **Others**: Qwen, Meta (Llama 4), Zhipu (GLM), Kimi
 - **Local**: Ollama, LM Studio, vLLM — any OpenAI-compatible endpoint
 - Automatic failover between providers
@@ -241,6 +249,16 @@ curl -X POST http://localhost:8080/api/v1/tasks \
 | `POST /api/v1/tasks/stream` | Yes | Shannon native (SSE) | Streaming orchestration |
 
 **Tool Execution:** `GET /api/v1/tools`, `POST /api/v1/tools/{name}/execute`
+
+**Auth:** `GET /api/v1/auth/me`, `POST /api/v1/auth/refresh-key`, `GET/POST/DELETE /api/v1/auth/api-keys`
+
+**Sessions:** `GET/PATCH/DELETE /api/v1/sessions/{id}`, history, events, files
+
+**Task Control:** `POST /api/v1/tasks/{id}/cancel|pause|resume`, `GET .../control-state|events|timeline`
+
+**Schedules:** Full CRUD at `/api/v1/schedules`, plus `pause`, `resume`, `runs`
+
+**Real-Time:** `GET /api/v1/stream/sse`, `GET /api/v1/stream/ws`, `WS /v1/ws/messages` (daemon)
 
 ## Project Structure
 
@@ -269,6 +287,7 @@ shannon/
 | `config/shannon.yaml` | Feature flags, auth, tracing |
 | `config/models.yaml` | LLM providers, pricing, capabilities |
 | `config/features.yaml` | Workflow settings, execution modes |
+| `config/openai_models.yaml` | Custom `shannon-*` model names for OpenAI-compatible API |
 | `config/research_strategies.yaml` | Research strategy model tiers |
 
 ### Service Ports (Local Development)
@@ -290,7 +309,7 @@ shannon/
 ```bash
 git clone https://github.com/Kocoro-lab/Shannon.git
 cd Shannon
-make setup-env                          # Create .env from template
+make setup                              # Create .env + generate protobuf stubs
 vim .env                                # Add your API key
 ./scripts/setup_python_wasi.sh          # Download Python WASI interpreter
 make dev                                # Start all services

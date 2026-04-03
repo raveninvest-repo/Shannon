@@ -344,6 +344,7 @@ services:
     image: waylandzhang/gateway:${SHANNON_VERSION:-latest}
     restart: unless-stopped
     environment:
+      - ENVIRONMENT=${ENVIRONMENT:-dev}
       - PORT=${GATEWAY_PORT:-8080}
       - ORCHESTRATOR_GRPC=${ORCHESTRATOR_GRPC:-orchestrator:50052}
       - ADMIN_SERVER=${ADMIN_SERVER:-http://orchestrator:8081}

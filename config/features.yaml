@@ -204,7 +204,7 @@ security:
 
 # Gateway defaults
 gateway:
-  skip_auth: false
+  skip_auth: true  # OSS default: auth disabled for local dev. Set to false + configure JWT for production.
 
 # Storage configuration
 storage:
