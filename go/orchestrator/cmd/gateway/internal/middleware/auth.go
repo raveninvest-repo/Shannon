@@ -35,8 +35,8 @@ func NewAuthMiddleware(authService AuthValidator, logger *zap.Logger) *AuthMiddl
 func (m *AuthMiddleware) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Check if auth should be skipped (DEVELOPMENT ONLY - NEVER USE IN PRODUCTION)
-		env := os.Getenv("ENVIRONMENT")
-		skipAuth := os.Getenv("GATEWAY_SKIP_AUTH")
+		env := strings.TrimSpace(os.Getenv("ENVIRONMENT"))
+		skipAuth := strings.TrimSpace(os.Getenv("GATEWAY_SKIP_AUTH"))
 
 		if skipAuth == "1" {
 			// Only allow auth skip in development environment
