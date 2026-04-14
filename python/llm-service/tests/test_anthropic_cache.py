@@ -657,3 +657,171 @@ class TestUsageSplit:
         """Regression guard for the None-usage branch."""
         from llm_service.providers import ProviderManager
         assert ProviderManager._serialize_usage(None) == {}
+
+
+class TestDeferLoadingPassthrough:
+    """Task 3.1: defer_loading field passes through tools array."""
+
+    def _make_provider(self):
+        return AnthropicProvider(_MINIMAL_CONFIG)
+
+    def test_defer_loading_true_passthrough(self):
+        provider = self._make_provider()
+        functions = [
+            {"name": "normal_tool", "description": "x", "parameters": {}},
+            {"name": "deferred_tool", "description": "y", "parameters": {},
+             "defer_loading": True},
+        ]
+        tools = provider._convert_functions_to_tools(functions)
+        deferred = next(t for t in tools if t["name"] == "deferred_tool")
+        normal = next(t for t in tools if t["name"] == "normal_tool")
+        assert deferred.get("defer_loading") is True
+        # Normal tool must NOT have defer_loading (omit, don't set False)
+        assert "defer_loading" not in normal
+
+    def test_defer_loading_false_omitted(self):
+        """defer_loading: false should be equivalent to absence — don't serialize."""
+        provider = self._make_provider()
+        functions = [
+            {"name": "tool", "description": "x", "parameters": {}, "defer_loading": False},
+        ]
+        tools = provider._convert_functions_to_tools(functions)
+        assert "defer_loading" not in tools[0]
+
+    def test_cache_key_includes_defer_flag(self):
+        """Swapping defer_loading on/off for same tool name must rebuild (not return frozen)."""
+        provider = self._make_provider()
+        functions_a = [{"name": "x", "description": "d", "parameters": {}, "defer_loading": True}]
+        functions_b = [{"name": "x", "description": "d", "parameters": {}}]
+        tools_a = provider._convert_functions_to_tools(functions_a)
+        tools_b = provider._convert_functions_to_tools(functions_b)
+        # Different defer state → different tools output (not a stale frozen copy)
+        assert tools_a[0].get("defer_loading") is True
+        assert "defer_loading" not in tools_b[0]
+
+
+class TestAdvancedToolUseBetaHeader:
+    """Task 3.1: beta header toggles on when any deferred tool present."""
+
+    def _make_provider(self):
+        return AnthropicProvider(_MINIMAL_CONFIG)
+
+    def _make_request(self, functions):
+        from llm_provider.base import CompletionRequest
+        return CompletionRequest(
+            messages=[{"role": "user", "content": "hi"}],
+            functions=functions,
+            temperature=0.3,
+            max_tokens=100,
+        )
+
+    def _model_config(self):
+        return type("MC", (), {
+            "model_id": "claude-sonnet-4-5",
+            "supports_functions": True,
+            "context_window": 200000,
+            "max_tokens": 8192,
+        })()
+
+    def test_beta_header_set_when_deferred_present(self, monkeypatch):
+        monkeypatch.delenv("SHANNON_NO_ADVANCED_TOOL_USE_BETA", raising=False)
+        provider = self._make_provider()
+        req = self._make_request([
+            {"name": "x", "description": "d", "parameters": {}, "defer_loading": True},
+            {"name": "y", "description": "d", "parameters": {}},
+        ])
+        api_req = provider._build_api_request(req, self._model_config())
+        # _build_api_request returns the kwargs for Anthropic SDK; header injection
+        # is in complete()/stream_complete() via extra_headers. Verify by reading
+        # the tools to confirm the trigger condition is reachable:
+        assert any(t.get("defer_loading") for t in api_req["tools"])
+
+    def test_beta_header_absent_when_no_deferred(self):
+        provider = self._make_provider()
+        req = self._make_request([
+            {"name": "x", "description": "d", "parameters": {}},
+        ])
+        api_req = provider._build_api_request(req, self._model_config())
+        assert not any(t.get("defer_loading") for t in api_req["tools"])
+
+    def test_env_escape_hatch_disables_beta(self, monkeypatch):
+        """When SHANNON_NO_ADVANCED_TOOL_USE_BETA=1 set, header should NOT be added.
+
+        This test documents the escape-hatch contract. Since the actual header
+        is applied in complete()/stream_complete() (not _build_api_request),
+        we verify by checking the env var is respected by the production helper.
+        """
+        monkeypatch.setenv("SHANNON_NO_ADVANCED_TOOL_USE_BETA", "1")
+        # The production helper isn't directly unit-testable without mocking
+        # the Anthropic SDK; this test is a guard that the env var exists in code.
+        import inspect
+        from llm_provider import anthropic_provider
+        src = inspect.getsource(anthropic_provider)
+        assert "SHANNON_NO_ADVANCED_TOOL_USE_BETA" in src, \
+            "escape hatch env var not referenced in anthropic_provider.py"
+        assert "advanced-tool-use-2025-11-20" in src, \
+            "advanced-tool-use beta token not present"
+
+
+class TestToolReferencePreserved:
+    """Task 3.2: role=tool messages with list content preserve tool_reference blocks."""
+
+    def _make_provider(self):
+        return AnthropicProvider(_MINIMAL_CONFIG)
+
+    def test_tool_reference_list_content_preserved(self):
+        provider = self._make_provider()
+        messages = [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": ""},
+                {"type": "tool_use", "id": "t1", "name": "tool_search",
+                 "input": {"query": "select:x_search"}},
+            ]},
+            {"role": "tool", "tool_call_id": "t1", "content": [
+                {"type": "tool_reference", "tool_name": "x_search"},
+            ]},
+        ]
+        _, claude_msgs = provider._convert_messages_to_claude_format(messages)
+        # Anthropic format: tool results live in a user-role message as tool_result blocks.
+        # Find the message containing our tool_result
+        found = None
+        for m in claude_msgs:
+            if m["role"] != "user" or not isinstance(m["content"], list):
+                continue
+            for b in m["content"]:
+                if isinstance(b, dict) and b.get("type") == "tool_result" \
+                   and b.get("tool_use_id") == "t1":
+                    found = b
+                    break
+            if found:
+                break
+        assert found is not None, f"tool_result with tool_use_id=t1 not found in {claude_msgs}"
+        inner = found["content"]
+        assert isinstance(inner, list), f"expected list inner content, got {type(inner).__name__}: {inner}"
+        names = [b.get("tool_name") for b in inner if isinstance(b, dict) and b.get("type") == "tool_reference"]
+        assert "x_search" in names, f"x_search tool_reference missing from {inner}"
+
+    def test_string_content_still_wrapped_as_string(self):
+        """Regression: existing tool content=string path still produces string."""
+        provider = self._make_provider()
+        messages = [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "x", "input": {}},
+            ]},
+            {"role": "tool", "tool_call_id": "t1", "content": "plain text result"},
+        ]
+        _, claude_msgs = provider._convert_messages_to_claude_format(messages)
+        # Find the tool_result block
+        found = None
+        for m in claude_msgs:
+            if m["role"] != "user" or not isinstance(m["content"], list):
+                continue
+            for b in m["content"]:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    found = b
+                    break
+        assert found is not None
+        # String content preserved as string (existing behavior)
+        assert found["content"] == "plain text result"

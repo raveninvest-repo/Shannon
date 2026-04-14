@@ -86,6 +86,29 @@ CACHE_TTL_LONG = {"type": "ephemeral", "ttl": "1h"}
 CACHE_TTL_SHORT = {"type": "ephemeral"}
 
 
+def _build_beta_header(
+    *,
+    thinking: bool,
+    any_deferred: bool,
+) -> Optional[str]:
+    """Build comma-separated anthropic-beta header value. Returns None when no beta is needed.
+
+    Combines interleaved-thinking-2025-05-14 (when thinking enabled) and
+    advanced-tool-use-2025-11-20 (when any deferred tool is present, unless
+    SHANNON_NO_ADVANCED_TOOL_USE_BETA=1 is set as an endpoint escape hatch for
+    GA paths that reject the beta token).
+    """
+    import os as _os
+    tokens: list[str] = []
+    if thinking:
+        tokens.append("interleaved-thinking-2025-05-14")
+    if any_deferred and _os.environ.get("SHANNON_NO_ADVANCED_TOOL_USE_BETA") != "1":
+        tokens.append("advanced-tool-use-2025-11-20")
+    if not tokens:
+        return None
+    return ",".join(tokens)
+
+
 class CacheBreakDetector:
     """Tracks API request state across calls to detect cache-breaking changes.
 
@@ -258,11 +281,21 @@ class AnthropicProvider(LLMProvider):
                 else:
                     claude_messages.append({"role": "assistant", "content": content})
             elif role == "tool":
-                # Convert OpenAI-style tool result to Anthropic tool_result content block
+                # Convert OpenAI-style tool result to Anthropic tool_result content block.
+                # Content may be a string (legacy plain-text tool results) or a list of
+                # content blocks (e.g. tool_reference blocks from a tool_search call).
+                # Preserve list shape so Anthropic sees the structured blocks; stringify
+                # only when something truly non-list/non-string slips through (defensive).
+                if isinstance(content, list):
+                    inner_content = content
+                elif isinstance(content, str):
+                    inner_content = content
+                else:
+                    inner_content = str(content or "")
                 tool_result_block = {
                     "type": "tool_result",
                     "tool_use_id": _ensure_tool_id(message.get("tool_call_id", "")),
-                    "content": content if isinstance(content, str) else str(content or ""),
+                    "content": inner_content,
                 }
                 # Merge into previous user message to maintain Anthropic's alternating role requirement
                 if claude_messages and claude_messages[-1]["role"] == "user":
@@ -342,9 +375,17 @@ class AnthropicProvider(LLMProvider):
         Frozen by tool name set: same names → return cached schemas (prevents
         description-drift cache breaks). Different name set → rebuild.
         """
-        # Cache key: sorted tool names
+        # Cache key: sorted (name, defer_loading) tuples. Including defer flag in the
+        # key ensures the frozen cache rebuilds when a tool toggles between deferred
+        # and non-deferred modes across sessions.
         key = str(sorted(
-            f.get("name") or (f.get("function") or {}).get("name", "")
+            (
+                (f.get("name") or (f.get("function") or {}).get("name", "") or ""),
+                bool(
+                    f.get("defer_loading")
+                    or (f.get("function") or {}).get("defer_loading")
+                ),
+            )
             for f in functions
         ))
 
@@ -371,6 +412,12 @@ class AnthropicProvider(LLMProvider):
                     "required": func.get("parameters", {}).get("required", []),
                 },
             }
+            # Task 3.1: Anthropic strips defer_loading:true tools from the prefix-hash
+            # before caching, so they don't invalidate the tools cache_control breakpoint
+            # even as the deferred set grows across sessions. Omit the field entirely
+            # when False so absence == disabled (avoids wire-format drift).
+            if func.get("defer_loading") is True:
+                tool["defer_loading"] = True
             tools.append(tool)
         # Sort by name for cache prefix stability across requests
         tools.sort(key=lambda t: t["name"])
@@ -594,8 +641,12 @@ class AnthropicProvider(LLMProvider):
 
         try:
             create_kwargs = dict(api_request)
-            if request.thinking:
-                create_kwargs["extra_headers"] = {"anthropic-beta": "interleaved-thinking-2025-05-14"}
+            beta = _build_beta_header(
+                thinking=bool(request.thinking),
+                any_deferred=any(t.get("defer_loading") for t in api_request.get("tools", [])),
+            )
+            if beta:
+                create_kwargs["extra_headers"] = {"anthropic-beta": beta}
             response = await self.client.messages.create(**create_kwargs)
         except anthropic.APIError as e:
             raise Exception(f"Anthropic API error: {e}")
@@ -707,8 +758,12 @@ class AnthropicProvider(LLMProvider):
         # Make streaming API call
         try:
             stream_kwargs = dict(api_request)
-            if request.thinking:
-                stream_kwargs["extra_headers"] = {"anthropic-beta": "interleaved-thinking-2025-05-14"}
+            beta = _build_beta_header(
+                thinking=bool(request.thinking),
+                any_deferred=any(t.get("defer_loading") for t in api_request.get("tools", [])),
+            )
+            if beta:
+                stream_kwargs["extra_headers"] = {"anthropic-beta": beta}
             async with self.client.messages.stream(**stream_kwargs) as stream:
                 async for text in stream.text_stream:
                     yield text
