@@ -172,6 +172,7 @@ async def analyze_complexity(
                 if settings and settings.complexity_model_id
                 else None
             ),
+            cache_source="complexity_analyze",
         )
         raw = result.get("output_text", "")
         data = _extract_json_block(raw)
@@ -381,6 +382,7 @@ async def analyze_task(request: Request, body: TaskAnalysisRequest):
             max_tokens=4096,
             temperature=0.0,
             response_format={"type": "json_object"},
+            cache_source="complexity_task",
         )
 
         raw = result.get("output_text", "")

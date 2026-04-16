@@ -507,7 +507,8 @@ Output format:
             messages=[{"role": "user", "content": prompt}],
             tier=ModelTier.SMALL,
             max_tokens=8000,
-            temperature=0.0  # Deterministic extraction
+            temperature=0.0,  # Deterministic extraction
+            cache_source="verify_extract_claims",
         )
 
         response = result.get("output_text", "")
@@ -598,7 +599,8 @@ IMPORTANT:
             messages=[{"role": "user", "content": prompt}],
             tier=ModelTier.SMALL,
             max_tokens=500,
-            temperature=0.0
+            temperature=0.0,
+            cache_source="verify_claim",
         )
 
         response = result.get("output_text", "")
@@ -806,7 +808,8 @@ Output JSON only.
             messages=[{"role": "user", "content": prompt}],
             tier=ModelTier.SMALL,
             max_tokens=500,
-            temperature=0.0
+            temperature=0.0,
+            cache_source="verify_claim_v2",
         )
 
         response = result.get("output_text", "").strip()
@@ -1415,7 +1418,8 @@ Output only the JSON array, nothing else.
             messages=[{"role": "user", "content": prompt}],
             tier=ModelTier.SMALL,
             max_tokens=4000,  # Need space for all claim judgments
-            temperature=0.0
+            temperature=0.0,
+            cache_source="verify_batch",
         )
 
         response = result.get("output_text", "").strip()

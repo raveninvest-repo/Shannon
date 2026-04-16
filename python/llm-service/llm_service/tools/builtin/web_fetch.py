@@ -88,6 +88,7 @@ async def extract_with_llm(
                 model_tier=ModelTier.SMALL,
                 max_tokens=max_output,
                 temperature=0.0,
+                cache_source="web_fetch_summary",
             ),
             timeout=timeout,
         )
@@ -246,6 +247,7 @@ async def extract_batch_with_llm(
                 model_tier=ModelTier.SMALL,
                 max_tokens=max_output,
                 temperature=0.0,
+                cache_source="web_fetch_extract",
             ),
             timeout=timeout,
         )

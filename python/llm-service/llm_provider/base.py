@@ -102,6 +102,8 @@ class TokenUsage:
     estimated_cost: float
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
+    cache_creation_5m_tokens: int = 0
+    cache_creation_1h_tokens: int = 0
     call_sequence: int = 0  # Monotonic counter: which LLM call within this provider session
 
     def __add__(self, other: "TokenUsage") -> "TokenUsage":
@@ -112,6 +114,8 @@ class TokenUsage:
             estimated_cost=self.estimated_cost + other.estimated_cost,
             cache_read_tokens=self.cache_read_tokens + other.cache_read_tokens,
             cache_creation_tokens=self.cache_creation_tokens + other.cache_creation_tokens,
+            cache_creation_5m_tokens=self.cache_creation_5m_tokens + other.cache_creation_5m_tokens,
+            cache_creation_1h_tokens=self.cache_creation_1h_tokens + other.cache_creation_1h_tokens,
             call_sequence=max(self.call_sequence, other.call_sequence),
         )
 

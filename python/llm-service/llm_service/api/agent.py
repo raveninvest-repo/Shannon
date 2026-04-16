@@ -4196,6 +4196,7 @@ async def generate_research_plan(
             tier=ModelTier.SMALL,
             max_tokens=2048,
             temperature=0.5,
+            cache_source="research_plan",
         )
         plan_text = result.get("output_text", "")
         usage = result.get("usage", {})

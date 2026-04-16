@@ -414,6 +414,8 @@ class ProviderManager:
             "cost_usd": usage.estimated_cost,
             "cache_read_tokens": usage.cache_read_tokens,
             "cache_creation_tokens": usage.cache_creation_tokens,
+            "cache_creation_5m_tokens": usage.cache_creation_5m_tokens,
+            "cache_creation_1h_tokens": usage.cache_creation_1h_tokens,
             "call_sequence": usage.call_sequence,
         }
 

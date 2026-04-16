@@ -68,6 +68,7 @@ async def compress_context(request: Request, body: CompressRequest) -> CompressR
             temperature=0.2,
             workflow_id=wf_id,
             agent_id=ag_id,
+            cache_source="context_summary",
         )
         completion = (result.get("output_text") or "").strip()
         usage = result.get("usage", {})

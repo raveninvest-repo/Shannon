@@ -113,6 +113,7 @@ async def extract_memory(request: Request, body: MemoryExtractRequest):
             max_tokens=1500,
             temperature=0.0,
             response_format={"type": "json_object"},
+            cache_source="memory_extract",
         )
 
         raw = llm_result.get("output_text", "")

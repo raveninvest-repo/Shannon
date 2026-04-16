@@ -156,6 +156,7 @@ async def evaluate_results(
             response_format={"type": "json_object"},
             workflow_id=wf_id,
             agent_id=ag_id,
+            cache_source="evaluate",
         )
         raw = result.get("output_text", "")
         data = _extract_json_block(raw)
