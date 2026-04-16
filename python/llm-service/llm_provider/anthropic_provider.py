@@ -92,7 +92,7 @@ CACHE_TTL_SHORT = {"type": "ephemeral"}
 # docs/cache-strategy.md. Unknown/unset → treated as short (fail cheap).
 _LONG_CACHE_SOURCES = frozenset({
     "slack", "line", "feishu", "lark", "telegram",
-    "tui", "oneshot_interactive", "cache_bench",
+    "tui", "shanclaw", "oneshot_interactive", "cache_bench",
 })
 
 
