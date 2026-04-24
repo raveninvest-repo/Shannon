@@ -96,20 +96,19 @@ _LONG_CACHE_SOURCES = frozenset({
 })
 
 
-def _ttl_block(request) -> Optional[Dict[str, str]]:
-    """Resolve the cache_control block to apply for this request, or None
-    to suppress prompt-cache writes entirely.
+def resolve_prompt_cache_ttl_block(cache_source: Optional[str]) -> Optional[Dict[str, str]]:
+    """Pure function: map a cache_source string to the cache_control block.
 
-    Precedence:
+    Public API so upstream callers (e.g. llm_service.api.agent) can resolve
+    the same TTL as the provider without depending on a CompletionRequest
+    object. Returns None when SHANNON_FORCE_TTL=off to suppress prompt-cache
+    writes entirely.
+
+    Precedence (matches _ttl_block):
       1. SHANNON_FORCE_TTL env (off / 5m / 1h) — operator escape hatch
-      2. request.cache_source → _LONG_CACHE_SOURCES map → 1h
-      3. Fallback → 5m  (short is the safe default: cron/webhook/mcp/one-shot
-         and all internal subagent paths pay 1.25x instead of 2x premium when
-         the cache will never be re-read)
-
-    Note: request.cache_ttl is NOT consulted here — that field drives
-    manager.py's response-cache TTL, a different layer. If a caller needs
-    explicit per-call prompt-cache control, use SHANNON_FORCE_TTL.
+      2. cache_source → _LONG_CACHE_SOURCES map → 1h
+      3. Fallback → 5m (short is the safe default for unknown / internal
+         subagent paths; 1.25x write premium vs 2x for 1h)
     """
     force = os.environ.get("SHANNON_FORCE_TTL", "").strip().lower()
     if force == "off":
@@ -119,10 +118,20 @@ def _ttl_block(request) -> Optional[Dict[str, str]]:
     if force == "1h":
         return CACHE_TTL_LONG
 
-    src = (getattr(request, "cache_source", None) or "").strip().lower()
+    src = (cache_source or "").strip().lower()
     if src in _LONG_CACHE_SOURCES:
         return CACHE_TTL_LONG
     return CACHE_TTL_SHORT
+
+
+def _ttl_block(request) -> Optional[Dict[str, str]]:
+    """Resolve the cache_control block for a CompletionRequest.
+
+    Thin wrapper over resolve_prompt_cache_ttl_block so provider and upstream
+    callers share one source of truth. Note: request.cache_ttl is NOT consulted
+    here — that field drives manager.py's response-cache TTL, a different layer.
+    """
+    return resolve_prompt_cache_ttl_block(getattr(request, "cache_source", None))
 
 
 # Per-session memo of the last applied rolling marker hash.
@@ -878,7 +887,68 @@ class AnthropicProvider(LLMProvider):
                 parts.append(f"model={break_info.get('prev_model', '')}→{break_info.get('new_model', '')}")
             logger.warning(" ".join(parts))
 
+        # Defensive: upstream callers (agent.py agent loop, history replay)
+        # inject cache_control with a hardcoded TTL that may not match the
+        # one resolved for this request's cache_source. Anthropic requires
+        # TTLs to be monotonic non-increasing across tools → system → messages.
+        # Force every existing cache_control to the single resolved ttl_block
+        # (or strip them entirely when SHANNON_FORCE_TTL=off).
+        self._force_uniform_cache_ttl(api_request, ttl_block)
+
         return api_request
+
+    @staticmethod
+    def _force_uniform_cache_ttl(api_request: Dict[str, Any], ttl_block: Optional[Dict[str, str]]) -> None:
+        """Boundary invariant: enforce a single uniform TTL on every cache_control
+        block before the request leaves the provider.
+
+        Behavior — note this IS a semantic override, not a merge:
+          - ttl_block is a dict: every existing cache_control value is REPLACED
+            with ttl_block, including any values an upstream caller explicitly
+            set. This is intentional: Anthropic requires TTL monotonic-non-
+            increasing across tools → system → messages, and the current design
+            contract is "single resolved TTL per request" so that the invariant
+            is trivially satisfied at every breakpoint. Heterogeneous TTL
+            layouts (e.g. 1h prefix + 5m tail) are not a supported path today;
+            if a future design requires them, this guard must be revisited.
+          - ttl_block is None (SHANNON_FORCE_TTL=off): every cache_control is
+            stripped so no prompt-cache writes happen.
+
+        Emits a debug log of how many blocks were modified. Persistent non-zero
+        counts for internal cache_sources signal an upstream caller (e.g. the
+        hardcoded CACHE_TTL_LONG injections in agent.py) whose TTL disagrees
+        with this request's resolved ttl_block — file a follow-up.
+        """
+        modified = 0
+
+        def _visit(container: Any) -> None:
+            nonlocal modified
+            if isinstance(container, dict):
+                # cache_control always sits directly on content-block dicts
+                # (tools, system blocks, message content blocks); there's no
+                # need to recurse into other dict values for Anthropic's schema.
+                if "cache_control" in container:
+                    if ttl_block is None:
+                        container.pop("cache_control", None)
+                        modified += 1
+                    elif container["cache_control"] != ttl_block:
+                        container["cache_control"] = ttl_block
+                        modified += 1
+            elif isinstance(container, list):
+                for item in container:
+                    _visit(item)
+
+        for t in api_request.get("tools", []) or []:
+            _visit(t)
+        _visit(api_request.get("system"))
+        for m in api_request.get("messages", []) or []:
+            _visit(m.get("content"))
+
+        if modified:
+            logger.debug(
+                "cache_control uniform-TTL guard modified %d block(s) (ttl_block=%r)",
+                modified, ttl_block,
+            )
 
     async def complete(self, request: CompletionRequest) -> CompletionResponse:
         """Generate a completion using Anthropic API"""

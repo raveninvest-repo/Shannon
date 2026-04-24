@@ -918,6 +918,11 @@ class AgentQuery(BaseModel):
         default=False,
         description="Enable streaming responses (returns SSE-style chunked deltas)",
     )
+    cache_source: Optional[str] = Field(
+        default=None,
+        description="Prompt-cache routing source (e.g. shanclaw/tui/agent_execute). "
+        "If unset, server falls back to context['cache_source'] or 'agent_execute'.",
+    )
 
 
 class AgentResponse(BaseModel):
@@ -979,6 +984,18 @@ async def agent_query(request: Request, query: AgentQuery):
         logger.info(f"Received agent query: {query.query[:100]}...")
         # Ensure allowed_tools metadata is always defined for responses
         effective_allowed_tools: List[str] = []
+
+        # Resolve cache_source once: explicit request field > context > default.
+        # Used both for provider TTL routing (short/long) and for the
+        # message-level cache_control TTL chosen below in the tool loop, so
+        # every cache_control block in the outgoing request agrees on one TTL.
+        cache_source = "agent_execute"
+        if isinstance(query.cache_source, str) and query.cache_source.strip():
+            cache_source = query.cache_source.strip()
+        elif isinstance(query.context, dict):
+            ctx_src = query.context.get("cache_source")
+            if isinstance(ctx_src, str) and ctx_src.strip():
+                cache_source = ctx_src.strip()
 
         # Check if we have real providers configured
         if (
@@ -1742,7 +1759,9 @@ async def agent_query(request: Request, query: AgentQuery):
                         workflow_id=request.headers.get("X-Workflow-ID")
                         or request.headers.get("x-workflow-id"),
                         agent_id=query.agent_id,
-                        cache_source="agent_execute_stream",
+                        cache_source=(cache_source + "_stream"
+                                      if cache_source == "agent_execute"
+                                      else cache_source),
                     ):
                         if not chunk:
                             continue
@@ -1899,7 +1918,7 @@ async def agent_query(request: Request, query: AgentQuery):
                     workflow_id=request.headers.get("X-Workflow-ID")
                     or request.headers.get("x-workflow-id"),
                     agent_id=query.agent_id,
-                    cache_source="agent_execute",
+                    cache_source=cache_source,
                 )
                 last_result_data = result_data
 
@@ -2031,20 +2050,25 @@ async def agent_query(request: Request, query: AgentQuery):
                                 if isinstance(block, dict):
                                     block.pop("cache_control", None)
 
-                    # Add to current last user message (1h TTL to match system/tools)
-                    from llm_provider.anthropic_provider import CACHE_TTL_LONG
-                    for i in range(len(messages) - 1, -1, -1):
-                        if messages[i]["role"] == "user":
-                            content = messages[i]["content"]
-                            if isinstance(content, str):
-                                messages[i]["content"] = [
-                                    {"type": "text", "text": content, "cache_control": CACHE_TTL_LONG}
-                                ]
-                            elif isinstance(content, list) and content:
-                                last = content[-1]
-                                if isinstance(last, dict):
-                                    last["cache_control"] = CACHE_TTL_LONG
-                            break
+                    # Add to current last user message. TTL must match the
+                    # provider's resolved ttl_block for this request so the
+                    # outgoing request has a single uniform TTL across
+                    # tools/system/messages (Anthropic rejects 1h-after-5m).
+                    from llm_provider.anthropic_provider import resolve_prompt_cache_ttl_block
+                    ttl_block = resolve_prompt_cache_ttl_block(cache_source)
+                    if ttl_block is not None:
+                        for i in range(len(messages) - 1, -1, -1):
+                            if messages[i]["role"] == "user":
+                                content = messages[i]["content"]
+                                if isinstance(content, str):
+                                    messages[i]["content"] = [
+                                        {"type": "text", "text": content, "cache_control": ttl_block}
+                                    ]
+                                elif isinstance(content, list) and content:
+                                    last = content[-1]
+                                    if isinstance(last, dict):
+                                        last["cache_control"] = ttl_block
+                                break
 
                 messages.append(
                     {
@@ -3483,7 +3507,23 @@ def _build_volatile_sections(body: AgentLoopStepRequest) -> list:
     return parts
 
 
-def _build_multi_turn_messages(body: AgentLoopStepRequest, system_prompt: str) -> list:
+def _resolve_loop_cache_source(body: "AgentLoopStepRequest") -> str:
+    """Pick the cache_source for a /agent/loop step.
+
+    Must be called identically by build_agent_messages() and agent_loop_step()
+    so that the TTL tagged on the frozen breakpoint (message-level) matches
+    the TTL the provider will resolve for the outgoing request. Otherwise
+    _force_uniform_cache_ttl in the provider would silently rewrite the
+    message-level TTL, making any "preserve upstream cache_source" intent
+    ineffective for interactive callers.
+    """
+    ctx_src = body.context.get("cache_source") if isinstance(body.context, dict) else None
+    if isinstance(ctx_src, str) and ctx_src.strip():
+        return ctx_src.strip()
+    return "agent_loop"
+
+
+def _build_multi_turn_messages(body: AgentLoopStepRequest, system_prompt: str, cache_source: str = "agent_loop") -> list:
     """Build append-only multi-turn messages for Anthropic prompt cache.
 
     Structure:
@@ -3530,7 +3570,11 @@ def _build_multi_turn_messages(body: AgentLoopStepRequest, system_prompt: str) -
     # The LAST frozen observation gets a cache_control breakpoint; previous ones
     # are plain list blocks. When a new turn is added, the old breakpoint message
     # loses cache_control but keeps its list format → prefix bytes unchanged → hit.
-    from llm_provider.anthropic_provider import CACHE_TTL_LONG
+    # Resolve TTL dynamically from cache_source so the frozen breakpoint
+    # matches whatever tools/system will get from the provider — avoids the
+    # 1h-after-5m Anthropic 400 when upstream is a short cache_source.
+    from llm_provider.anthropic_provider import resolve_prompt_cache_ttl_block
+    ttl_block = resolve_prompt_cache_ttl_block(cache_source)
     replay_turns = [t for t in body.history if t.assistant_replay]
     for i, turn in enumerate(replay_turns):
         # Frozen assistant replay (compact deterministic JSON)
@@ -3541,8 +3585,8 @@ def _build_multi_turn_messages(body: AgentLoopStepRequest, system_prompt: str) -
             # Frozen observation — always list format for byte-stable prefix.
             # Only the last frozen one (second-to-last user msg) gets cache_control.
             block: dict = {"type": "text", "text": obs_text}
-            if i == len(replay_turns) - 2:
-                block["cache_control"] = CACHE_TTL_LONG
+            if i == len(replay_turns) - 2 and ttl_block is not None:
+                block["cache_control"] = ttl_block
             messages.append({"role": "user", "content": [block]})
         else:
             # LATEST observation — volatile state, plain string (never cached)
@@ -3614,7 +3658,7 @@ def build_agent_messages(body: AgentLoopStepRequest, raw_attachments=None) -> li
     use_multi_turn = has_replay and (body.model_tier in ("medium", "large") or is_non_haiku_override)
     if use_multi_turn:
         logger.info(f"AgentLoop: multi-turn mode (agent={body.agent_id}, tier={body.model_tier}, turns={len([t for t in body.history if t.assistant_replay])})")
-        return _build_multi_turn_messages(body, system_prompt)
+        return _build_multi_turn_messages(body, system_prompt, _resolve_loop_cache_source(body))
 
     # --- Legacy: single user message (original structure) ---
     user_parts: list[str] = []
@@ -3835,7 +3879,10 @@ async def agent_loop_step(request: Request, body: AgentLoopStepRequest) -> Agent
                 gen_kwargs["response_format"] = {"type": "json_object"}
         if body.previous_response_id:
             gen_kwargs["previous_response_id"] = body.previous_response_id
-        gen_kwargs.setdefault("cache_source", "agent_loop")
+        # Same helper used by build_agent_messages when it tagged the frozen
+        # breakpoint — keeps message-level TTL and provider-resolved TTL in
+        # lockstep so _force_uniform_cache_ttl has nothing to rewrite.
+        gen_kwargs.setdefault("cache_source", _resolve_loop_cache_source(body))
 
         result = await providers.generate_completion(
             messages=messages,
