@@ -7,11 +7,14 @@ cache_ttl field is intentionally NOT consulted for prompt-cache routing
 
 import os
 
+import pytest
+
 # Set dummy key before import
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key-for-unit-tests")
 
 from llm_provider.anthropic_provider import (
     _ttl_block,
+    resolve_prompt_cache_ttl_block,
     CACHE_TTL_LONG,
     CACHE_TTL_SHORT,
 )
@@ -122,3 +125,74 @@ class TestCacheTtlFieldIgnored:
         )
         # webhook source still routes to short regardless of cache_ttl=3600
         assert _ttl_block(req) == CACHE_TTL_SHORT
+
+
+class TestResolvePromptCacheTtlBlock:
+    """Public pure-function API: same semantics as _ttl_block but takes a
+    cache_source string so upstream callers (llm_service.api.agent) don't
+    need a CompletionRequest object to resolve the TTL for message-level
+    cache_control writes."""
+
+    def test_long_source_returns_long(self):
+        assert resolve_prompt_cache_ttl_block("shanclaw") == CACHE_TTL_LONG
+        assert resolve_prompt_cache_ttl_block("slack") == CACHE_TTL_LONG
+
+    def test_short_source_returns_short(self):
+        assert resolve_prompt_cache_ttl_block("agent_execute") == CACHE_TTL_SHORT
+        assert resolve_prompt_cache_ttl_block("agent_loop") == CACHE_TTL_SHORT
+        assert resolve_prompt_cache_ttl_block("webhook") == CACHE_TTL_SHORT
+
+    def test_none_and_empty_return_short(self):
+        assert resolve_prompt_cache_ttl_block(None) == CACHE_TTL_SHORT
+        assert resolve_prompt_cache_ttl_block("") == CACHE_TTL_SHORT
+
+    def test_case_insensitive(self):
+        assert resolve_prompt_cache_ttl_block("SHANCLAW") == CACHE_TTL_LONG
+        assert resolve_prompt_cache_ttl_block("ShanClaw") == CACHE_TTL_LONG
+
+    def test_force_off_returns_none(self, monkeypatch):
+        monkeypatch.setenv("SHANNON_FORCE_TTL", "off")
+        assert resolve_prompt_cache_ttl_block("shanclaw") is None
+        assert resolve_prompt_cache_ttl_block("agent_execute") is None
+
+    def test_force_1h_overrides_short_source(self, monkeypatch):
+        monkeypatch.setenv("SHANNON_FORCE_TTL", "1h")
+        assert resolve_prompt_cache_ttl_block("agent_execute") == CACHE_TTL_LONG
+
+    def test_force_5m_overrides_long_source(self, monkeypatch):
+        monkeypatch.setenv("SHANNON_FORCE_TTL", "5m")
+        assert resolve_prompt_cache_ttl_block("shanclaw") == CACHE_TTL_SHORT
+
+
+class TestTtlBlockPublicWrapperParity:
+    """_ttl_block(request) must stay byte-equivalent to
+    resolve_prompt_cache_ttl_block(request.cache_source).
+
+    This pins the root-cause fix invariant for agent.py: when agent.py
+    writes message-level cache_control using the public helper, the
+    provider's own writes (via _ttl_block) land on the exact same dict.
+    If this parity ever drifts, the uniform-TTL guard is the only thing
+    stopping another Anthropic 400, which is a regression."""
+
+    @pytest.mark.parametrize("source", [
+        None, "", "shanclaw", "slack", "feishu", "tui", "cache_bench",
+        "agent_execute", "agent_loop", "agent_execute_stream",
+        "webhook", "cron", "mcp", "swarm_subagent",
+    ])
+    def test_wrapper_matches_public(self, source):
+        req = CompletionRequest(
+            messages=[{"role": "user", "content": "hi"}],
+            model="claude-sonnet-4-6",
+            cache_source=source,
+        )
+        assert _ttl_block(req) == resolve_prompt_cache_ttl_block(source)
+
+    @pytest.mark.parametrize("force", ["off", "5m", "1h", "bogus"])
+    def test_parity_holds_under_env_overrides(self, monkeypatch, force):
+        monkeypatch.setenv("SHANNON_FORCE_TTL", force)
+        req = CompletionRequest(
+            messages=[{"role": "user", "content": "hi"}],
+            model="claude-sonnet-4-6",
+            cache_source="shanclaw",
+        )
+        assert _ttl_block(req) == resolve_prompt_cache_ttl_block("shanclaw")

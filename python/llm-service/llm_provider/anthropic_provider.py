@@ -96,20 +96,19 @@ _LONG_CACHE_SOURCES = frozenset({
 })
 
 
-def _ttl_block(request) -> Optional[Dict[str, str]]:
-    """Resolve the cache_control block to apply for this request, or None
-    to suppress prompt-cache writes entirely.
+def resolve_prompt_cache_ttl_block(cache_source: Optional[str]) -> Optional[Dict[str, str]]:
+    """Pure function: map a cache_source string to the cache_control block.
 
-    Precedence:
+    Public API so upstream callers (e.g. llm_service.api.agent) can resolve
+    the same TTL as the provider without depending on a CompletionRequest
+    object. Returns None when SHANNON_FORCE_TTL=off to suppress prompt-cache
+    writes entirely.
+
+    Precedence (matches _ttl_block):
       1. SHANNON_FORCE_TTL env (off / 5m / 1h) — operator escape hatch
-      2. request.cache_source → _LONG_CACHE_SOURCES map → 1h
-      3. Fallback → 5m  (short is the safe default: cron/webhook/mcp/one-shot
-         and all internal subagent paths pay 1.25x instead of 2x premium when
-         the cache will never be re-read)
-
-    Note: request.cache_ttl is NOT consulted here — that field drives
-    manager.py's response-cache TTL, a different layer. If a caller needs
-    explicit per-call prompt-cache control, use SHANNON_FORCE_TTL.
+      2. cache_source → _LONG_CACHE_SOURCES map → 1h
+      3. Fallback → 5m (short is the safe default for unknown / internal
+         subagent paths; 1.25x write premium vs 2x for 1h)
     """
     force = os.environ.get("SHANNON_FORCE_TTL", "").strip().lower()
     if force == "off":
@@ -119,10 +118,20 @@ def _ttl_block(request) -> Optional[Dict[str, str]]:
     if force == "1h":
         return CACHE_TTL_LONG
 
-    src = (getattr(request, "cache_source", None) or "").strip().lower()
+    src = (cache_source or "").strip().lower()
     if src in _LONG_CACHE_SOURCES:
         return CACHE_TTL_LONG
     return CACHE_TTL_SHORT
+
+
+def _ttl_block(request) -> Optional[Dict[str, str]]:
+    """Resolve the cache_control block for a CompletionRequest.
+
+    Thin wrapper over resolve_prompt_cache_ttl_block so provider and upstream
+    callers share one source of truth. Note: request.cache_ttl is NOT consulted
+    here — that field drives manager.py's response-cache TTL, a different layer.
+    """
+    return resolve_prompt_cache_ttl_block(getattr(request, "cache_source", None))
 
 
 # Per-session memo of the last applied rolling marker hash.
