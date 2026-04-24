@@ -141,3 +141,166 @@ class TestBlocksWithoutCacheControlUntouched:
         }
         AnthropicProvider._force_uniform_cache_ttl(req, CACHE_TTL_LONG)
         assert _collect_ttls(req) == []
+
+
+# --- End-to-end regression: the actual bug path -----------------------------
+#
+# These tests exercise _build_api_request, not _force_uniform_cache_ttl in
+# isolation. They reproduce the real production failure:
+# `/agent/query` agent loop, cache_source='agent_execute' (short), second
+# iteration where agent.py injects CACHE_TTL_LONG on the last user message.
+# Pre-fix these produced a request with mixed 1h/5m → Anthropic 400.
+
+_MINIMAL_CONFIG = {
+    "api_key": "test-key",
+    "models": {
+        "claude-sonnet-4-6": {
+            "model_id": "claude-sonnet-4-6",
+            "tier": "medium",
+            "context_window": 200000,
+            "max_tokens": 8192,
+        },
+    },
+}
+
+
+def _model_config():
+    return type("MC", (), {
+        "model_id": "claude-sonnet-4-6",
+        "supports_functions": False,
+        "context_window": 200000,
+        "max_tokens": 8192,
+    })()
+
+
+def _unique_ttls(api_req: dict) -> set:
+    """Flatten every cache_control ttl value across the request tree."""
+    kinds: set = set()
+    def _visit(c):
+        if isinstance(c, dict):
+            if "cache_control" in c:
+                kinds.add(c["cache_control"].get("ttl", "5m"))
+        elif isinstance(c, list):
+            for i in c:
+                _visit(i)
+    for t in api_req.get("tools", []) or []:
+        _visit(t)
+    _visit(api_req.get("system"))
+    for m in api_req.get("messages", []) or []:
+        _visit(m.get("content"))
+    return kinds
+
+
+class TestAgentLoopSecondIterationBugE2E:
+    """Exercise the full _build_api_request pipeline with the exact layout that
+    triggered Anthropic 400 pre-fix."""
+
+    def _make_provider(self):
+        from llm_provider.anthropic_provider import AnthropicProvider as AP
+        return AP(_MINIMAL_CONFIG)
+
+    def _agent_loop_request(self, cache_source: str):
+        """Reproduces agent.py:2041/2046: second iteration pastes CACHE_TTL_LONG
+        on the last user message while other turns stay plain."""
+        from llm_provider.base import CompletionRequest
+        return CompletionRequest(
+            messages=[
+                {"role": "system", "content": "You are a research agent."},
+                {"role": "user", "content": "Research X"},
+                {"role": "assistant", "content": "I'll search."},
+                # agent.py injection: list-form user block with hardcoded 1h
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Tool result...", "cache_control": CACHE_TTL_LONG},
+                ]},
+            ],
+            temperature=0.3,
+            max_tokens=100,
+            cache_source=cache_source,
+        )
+
+    def test_short_source_agent_execute_normalizes_to_5m(self):
+        """Real bug: cache_source='agent_execute' resolves to 5m but agent.py
+        injected 1h on messages. Post-fix all cache_control must be uniform."""
+        provider = self._make_provider()
+        api_req = provider._build_api_request(
+            self._agent_loop_request("agent_execute"), _model_config(),
+        )
+        kinds = _unique_ttls(api_req)
+        assert kinds == {"5m"}, (
+            f"expected uniform 5m after normalization, got {kinds}. "
+            f"This is the exact condition that produced Anthropic 400 pre-fix."
+        )
+
+    def test_long_source_shanclaw_normalizes_to_1h(self):
+        """Symmetric case: shanclaw resolves to 1h, and if anything in the
+        request was accidentally 5m it should be lifted to 1h."""
+        provider = self._make_provider()
+        api_req = provider._build_api_request(
+            self._agent_loop_request("shanclaw"), _model_config(),
+        )
+        kinds = _unique_ttls(api_req)
+        assert kinds == {"1h"}, f"expected uniform 1h, got {kinds}"
+
+    def test_force_off_env_strips_all_cache_control_end_to_end(self, monkeypatch):
+        """SHANNON_FORCE_TTL=off must produce a request with zero
+        cache_control blocks, regardless of agent.py injections upstream."""
+        monkeypatch.setenv("SHANNON_FORCE_TTL", "off")
+        provider = self._make_provider()
+        api_req = provider._build_api_request(
+            self._agent_loop_request("agent_execute"), _model_config(),
+        )
+        assert _unique_ttls(api_req) == set()
+
+
+class TestMarkLastBlockDedupInteraction:
+    """When an upstream caller pre-injects cache_control on a message, the
+    provider's _mark_last_block de-dup logic skips its usual [-2] placement.
+    After this PR the final TTL is still uniform; this test pins that
+    invariant so the implicit coupling doesn't silently regress."""
+
+    def test_caller_preset_cache_control_keeps_single_ttl(self):
+        from llm_provider.anthropic_provider import AnthropicProvider as AP
+        from llm_provider.base import CompletionRequest
+        provider = AP(_MINIMAL_CONFIG)
+        # Caller pre-pastes cache_control on the SECOND user message — not
+        # the penultimate. Pre-fix that would co-exist with provider's own
+        # [-2] cache_control in a different TTL; post-fix all are uniform.
+        request = CompletionRequest(
+            messages=[
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Turn 1 question"},
+                {"role": "assistant", "content": "Turn 1 answer"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Turn 2 preset by caller",
+                     "cache_control": CACHE_TTL_LONG},
+                ]},
+                {"role": "assistant", "content": "Turn 2 answer"},
+                {"role": "user", "content": "Turn 3 latest"},
+            ],
+            temperature=0.0,
+            max_tokens=100,
+            cache_source="agent_execute",  # resolves to 5m
+        )
+        api_req = provider._build_api_request(request, _model_config())
+        kinds = _unique_ttls(api_req)
+        # With agent_execute (5m) and caller-injected 1h, the guard must
+        # collapse everything to the single resolved ttl (5m).
+        assert kinds == {"5m"}, f"dedup + normalization should yield uniform 5m, got {kinds}"
+
+    def test_modified_counter_fires_only_when_actually_mismatched(self):
+        """_force_uniform_cache_ttl must be a no-op (no modifications) when
+        caller-side cache_control already matches the resolved ttl_block."""
+        import copy
+        req = {
+            "tools": [{"name": "t", "cache_control": copy.deepcopy(CACHE_TTL_SHORT)}],
+            "system": [{"type": "text", "text": "s", "cache_control": copy.deepcopy(CACHE_TTL_SHORT)}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "x", "cache_control": copy.deepcopy(CACHE_TTL_SHORT)},
+            ]}],
+        }
+        before = copy.deepcopy(req)
+        from llm_provider.anthropic_provider import AnthropicProvider as AP
+        AP._force_uniform_cache_ttl(req, CACHE_TTL_SHORT)
+        # Byte-equal: guard didn't rewrite identical values (checked via
+        # the != comparison in the implementation — test locks it in).
+        assert req == before

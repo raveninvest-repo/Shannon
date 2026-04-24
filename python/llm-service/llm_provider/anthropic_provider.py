@@ -890,18 +890,39 @@ class AnthropicProvider(LLMProvider):
 
     @staticmethod
     def _force_uniform_cache_ttl(api_request: Dict[str, Any], ttl_block: Optional[Dict[str, str]]) -> None:
-        """Normalize every cache_control block in api_request to ttl_block.
+        """Boundary invariant: enforce a single uniform TTL on every cache_control
+        block before the request leaves the provider.
 
-        When ttl_block is None (SHANNON_FORCE_TTL=off), strips all cache_control
-        so no prompt-cache writes happen.
+        Behavior — note this IS a semantic override, not a merge:
+          - ttl_block is a dict: every existing cache_control value is REPLACED
+            with ttl_block, including any values an upstream caller explicitly
+            set. This is intentional: Anthropic requires TTL monotonic-non-
+            increasing across tools → system → messages, and b1d05cc established
+            "single resolved TTL per request" as the design contract
+            (commit: "trivially satisfying monotonic TTL across all 4 breakpoints").
+            Heterogeneous TTL layouts (e.g. 1h prefix + 5m tail) are not a
+            supported path today; if a future design requires them, this guard
+            must be revisited.
+          - ttl_block is None (SHANNON_FORCE_TTL=off): every cache_control is
+            stripped so no prompt-cache writes happen.
+
+        Emits a debug log of how many blocks were modified. Persistent non-zero
+        counts for internal cache_sources signal an upstream caller (e.g. the
+        hardcoded CACHE_TTL_LONG injections in agent.py) whose TTL disagrees
+        with this request's resolved ttl_block — file a follow-up.
         """
+        modified = 0
+
         def _visit(container: Any) -> None:
+            nonlocal modified
             if isinstance(container, dict):
                 if "cache_control" in container:
                     if ttl_block is None:
                         container.pop("cache_control", None)
-                    else:
+                        modified += 1
+                    elif container["cache_control"] != ttl_block:
                         container["cache_control"] = ttl_block
+                        modified += 1
             elif isinstance(container, list):
                 for item in container:
                     _visit(item)
@@ -911,6 +932,12 @@ class AnthropicProvider(LLMProvider):
         _visit(api_request.get("system"))
         for m in api_request.get("messages", []) or []:
             _visit(m.get("content"))
+
+        if modified:
+            logger.debug(
+                "cache_control uniform-TTL guard modified %d block(s) (ttl_block=%r)",
+                modified, ttl_block,
+            )
 
     async def complete(self, request: CompletionRequest) -> CompletionResponse:
         """Generate a completion using Anthropic API"""
