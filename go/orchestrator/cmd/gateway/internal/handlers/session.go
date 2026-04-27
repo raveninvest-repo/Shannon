@@ -241,18 +241,19 @@ func (h *SessionHandler) GetSession(w http.ResponseWriter, r *http.Request) {
 	tokensUsed := 0
 	{
 		var aggregatedTokens int
+		var dbErr error
 		if extID, ok := contextData["external_id"].(string); ok && extID != "" {
-			err = h.db.GetContext(ctx, &aggregatedTokens, `
+			dbErr = h.db.GetContext(ctx, &aggregatedTokens, `
 				SELECT COALESCE(SUM(cache_aware_total_tokens), 0)::int FROM task_executions
 				WHERE (session_id = $1 OR session_id = $2) AND user_id = $3 AND tenant_id = $4
 			`, session.ID, extID, userCtx.UserID.String(), userCtx.TenantID)
 		} else {
-			err = h.db.GetContext(ctx, &aggregatedTokens, `
+			dbErr = h.db.GetContext(ctx, &aggregatedTokens, `
 				SELECT COALESCE(SUM(cache_aware_total_tokens), 0)::int FROM task_executions
 				WHERE session_id = $1 AND user_id = $2 AND tenant_id = $3
 			`, session.ID, userCtx.UserID.String(), userCtx.TenantID)
 		}
-		if err == nil && aggregatedTokens > 0 {
+		if dbErr == nil && aggregatedTokens > 0 {
 			tokensUsed = aggregatedTokens
 		}
 	}
