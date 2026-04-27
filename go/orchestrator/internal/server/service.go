@@ -238,6 +238,20 @@ type RecordUsageDetails struct {
 	Provider              string
 }
 
+// EnsureCacheAwareTotal back-fills CacheAwareTotalTokens from the parts when
+// the caller forgot to pre-compute it. Enterprise quota recorders gate on
+// CacheAwareTotalTokens, so a missing rollup would otherwise be silently
+// dropped — turning the field into a footgun for new call sites.
+func (d *RecordUsageDetails) EnsureCacheAwareTotal() {
+	if d == nil || d.CacheAwareTotalTokens > 0 {
+		return
+	}
+	parts := d.InputTokens + d.OutputTokens + d.CacheReadTokens + d.CacheCreationTokens
+	if parts > 0 {
+		d.CacheAwareTotalTokens = parts
+	}
+}
+
 // RecordUsage is a no-op in the open source version. shannon-cloud overrides
 // this method to drive enterprise quota tracking; the RecordUsageDetails
 // argument carries the full cache-aware breakdown so the override can bill
@@ -3281,8 +3295,7 @@ func (s *OrchestratorService) RecordTokenUsage(
 		Model:                 req.Model,
 		Provider:              req.Provider,
 	}
-	details.CacheAwareTotalTokens = details.InputTokens + details.OutputTokens +
-		details.CacheReadTokens + details.CacheCreationTokens
+	details.EnsureCacheAwareTotal()
 	s.RecordUsage(ctx, tenantUUID, req.WorkflowId, details)
 
 	return &pb.RecordTokenUsageResponse{Success: true}, nil
