@@ -114,6 +114,12 @@ type TaskExecution struct {
 	CacheReadTokens     int `db:"cache_read_tokens"`
 	CacheCreationTokens int `db:"cache_creation_tokens"`
 
+	// Cache-aware rollup: prompt + completion + cache_read + cache_creation.
+	// Parallel to TotalTokens (= prompt + completion); used by quota tracking
+	// where prompt-cache cost must count, while keeping TotalTokens
+	// OpenAI-compatible. See migration 121.
+	CacheAwareTotalTokens int `db:"cache_aware_total_tokens"`
+
 	// Structured response (unified API format, stored in response JSONB column)
 	Response JSONB `db:"response"`
 

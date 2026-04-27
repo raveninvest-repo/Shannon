@@ -115,7 +115,8 @@ func (c *Client) SaveTaskExecution(ctx context.Context, task *TaskExecution) err
             duration_ms, agents_used, tools_invoked, cache_hits,
             complexity_score, response, metadata, created_at,
             trigger_type, schedule_id,
-            cache_read_tokens, cache_creation_tokens
+            cache_read_tokens, cache_creation_tokens,
+            cache_aware_total_tokens
         ) VALUES (
             $1, $2, $3, $4, $5,
             $6, $7, $8,
@@ -126,7 +127,8 @@ func (c *Client) SaveTaskExecution(ctx context.Context, task *TaskExecution) err
             $19, $20, $21, $22,
             $23, $24, $25, $26,
             $27, $28,
-            $29, $30
+            $29, $30,
+            $31
         )
         ON CONFLICT (workflow_id) DO UPDATE SET
             status = EXCLUDED.status,
@@ -148,8 +150,14 @@ func (c *Client) SaveTaskExecution(ctx context.Context, task *TaskExecution) err
             metadata = EXCLUDED.metadata,
             tenant_id = COALESCE(EXCLUDED.tenant_id, task_executions.tenant_id),
             cache_read_tokens = EXCLUDED.cache_read_tokens,
-            cache_creation_tokens = EXCLUDED.cache_creation_tokens
+            cache_creation_tokens = EXCLUDED.cache_creation_tokens,
+            cache_aware_total_tokens = EXCLUDED.cache_aware_total_tokens
         RETURNING id`
+
+	if task.CacheAwareTotalTokens == 0 {
+		task.CacheAwareTotalTokens = task.PromptTokens + task.CompletionTokens +
+			task.CacheReadTokens + task.CacheCreationTokens
+	}
 
 	err := c.db.QueryRowContext(ctx, teQuery,
 		task.ID, task.WorkflowID, userID, sessionID, tenantID,
@@ -162,6 +170,7 @@ func (c *Client) SaveTaskExecution(ctx context.Context, task *TaskExecution) err
 		task.ComplexityScore, response, metadata, task.CreatedAt,
 		triggerType, task.ScheduleID,
 		task.CacheReadTokens, task.CacheCreationTokens,
+		task.CacheAwareTotalTokens,
 	).Scan(&task.ID)
 	if err != nil {
 		return fmt.Errorf("failed to save task execution: %w", err)
@@ -191,7 +200,8 @@ func (c *Client) BatchSaveTaskExecutions(ctx context.Context, tasks []*TaskExecu
                 duration_ms, agents_used, tools_invoked, cache_hits,
                 complexity_score, response, metadata, created_at,
                 trigger_type, schedule_id,
-                cache_read_tokens, cache_creation_tokens
+                cache_read_tokens, cache_creation_tokens,
+                cache_aware_total_tokens
             ) VALUES (
                 $1, $2, $3, $4, $5,
                 $6, $7, $8,
@@ -202,7 +212,8 @@ func (c *Client) BatchSaveTaskExecutions(ctx context.Context, tasks []*TaskExecu
                 $19, $20, $21, $22,
                 $23, $24, $25, $26,
                 $27, $28,
-                $29, $30
+                $29, $30,
+                $31
             )
             ON CONFLICT (workflow_id) DO UPDATE SET
                 status = EXCLUDED.status,
@@ -224,7 +235,8 @@ func (c *Client) BatchSaveTaskExecutions(ctx context.Context, tasks []*TaskExecu
                 metadata = EXCLUDED.metadata,
                 tenant_id = COALESCE(EXCLUDED.tenant_id, task_executions.tenant_id),
                 cache_read_tokens = EXCLUDED.cache_read_tokens,
-                cache_creation_tokens = EXCLUDED.cache_creation_tokens
+                cache_creation_tokens = EXCLUDED.cache_creation_tokens,
+                cache_aware_total_tokens = EXCLUDED.cache_aware_total_tokens
         `)
 		if err != nil {
 			return err
@@ -270,6 +282,11 @@ func (c *Client) BatchSaveTaskExecutions(ctx context.Context, tasks []*TaskExecu
 				triggerType = "api"
 			}
 
+			if task.CacheAwareTotalTokens == 0 {
+				task.CacheAwareTotalTokens = task.PromptTokens + task.CompletionTokens +
+					task.CacheReadTokens + task.CacheCreationTokens
+			}
+
 			_, err := stmt.ExecContext(ctx,
 				task.ID, task.WorkflowID, userID, sessionID, tenantID,
 				task.Query, task.Mode, task.Status,
@@ -281,6 +298,7 @@ func (c *Client) BatchSaveTaskExecutions(ctx context.Context, tasks []*TaskExecu
 				task.ComplexityScore, response, metadata, task.CreatedAt,
 				triggerType, task.ScheduleID,
 				task.CacheReadTokens, task.CacheCreationTokens,
+				task.CacheAwareTotalTokens,
 			)
 			if err != nil {
 				return fmt.Errorf("failed to insert task %s: %w", task.WorkflowID, err)
