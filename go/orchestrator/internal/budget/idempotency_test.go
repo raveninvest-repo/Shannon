@@ -73,6 +73,7 @@ func TestRecordUsage_Idempotency(t *testing.T) {
 		sqlmock.AnyArg(),        // cost_usd
 		0,                       // cache_read_tokens
 		0,                       // cache_creation_tokens
+		150,                     // cache_aware_total_tokens (= 100 + 50 + 0 + 0)
 		0,                       // call_sequence
 	).WillReturnResult(sqlmock.NewResult(1, 1))
 

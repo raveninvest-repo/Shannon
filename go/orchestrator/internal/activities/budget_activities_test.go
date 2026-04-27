@@ -58,6 +58,38 @@ func TestCheckTokenBudgetWithBackpressure_ReturnsDelayValue(t *testing.T) {
 	}
 }
 
+// Pure cache hits (zero input/output but cache_read or cache_creation > 0)
+// must be recorded so quota accounting can bill prompt-cache cost.
+func TestShouldRecordUsage_PureCacheHitNotSkipped(t *testing.T) {
+	cases := []struct {
+		name                                      string
+		inputTokens, outputTokens                 int
+		cacheReadTokens, cacheCreationTokens      int
+		recordZeroToken, hasToolCosts             bool
+		want                                      bool
+	}{
+		{"pure cache_read hit", 0, 0, 5000, 0, false, false, true},
+		{"pure cache_creation", 0, 0, 0, 3000, false, false, true},
+		{"both cache classes", 0, 0, 100, 200, false, false, true},
+		{"normal call", 50, 30, 0, 0, false, false, true},
+		{"zero across the board", 0, 0, 0, 0, false, false, false},
+		{"zero with tool costs", 0, 0, 0, 0, false, true, true},
+		{"zero with audit flag", 0, 0, 0, 0, true, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := shouldRecordUsage(
+				tc.inputTokens, tc.outputTokens,
+				tc.cacheReadTokens, tc.cacheCreationTokens,
+				tc.recordZeroToken, tc.hasToolCosts,
+			)
+			if got != tc.want {
+				t.Errorf("shouldRecordUsage(...) = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // Test that circuit breaker in open state blocks requests via activity
 func TestCheckTokenBudgetWithCircuitBreaker_OpenBlocks(t *testing.T) {
 	mgr := budget.NewBudgetManager(nil, zap.NewNop())

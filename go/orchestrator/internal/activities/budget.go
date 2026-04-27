@@ -274,6 +274,25 @@ func detectProviderFromModel(model string) string {
 	return models.DetectProvider(model)
 }
 
+// shouldRecordUsage decides whether to persist a token_usage row given the
+// breakdown observed from an agent execution. Returns true when at least one
+// of these holds:
+//  1. the call consumed input/output tokens,
+//  2. the caller asked for zero-token audit (record_zero_token flag),
+//  3. there are tool costs to attribute, or
+//  4. the call read or wrote prompt cache (whose cost must still be billed
+//     even if input+output happen to be zero — the failure mode we're
+//     guarding against here is the cache leak).
+func shouldRecordUsage(inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens int, recordZeroToken, hasToolCosts bool) bool {
+	if (inputTokens + outputTokens) > 0 {
+		return true
+	}
+	if recordZeroToken || hasToolCosts {
+		return true
+	}
+	return cacheReadTokens > 0 || cacheCreationTokens > 0
+}
+
 // ExecuteAgentWithBudget executes an agent with token budget constraints
 func (b *BudgetActivities) ExecuteAgentWithBudget(ctx context.Context, input BudgetedAgentInput) (*AgentExecutionResult, error) {
 	b.logger.Info("Executing agent with budget constraints",
@@ -407,9 +426,12 @@ func (b *BudgetActivities) ExecuteAgentWithBudget(ctx context.Context, input Bud
 		}
 	}
 
-	// Skip recording zero-token runs unless explicitly requested or tool costs exist
-	if (inputTokens+outputTokens) == 0 && !recordZeroToken && !hasToolCosts {
-		b.logger.Warn("Skipping token usage record: zero tokens and no record_zero_token flag",
+	// Skip recording only when nothing of value happened: zero input/output, no
+	// audit flag, no tool costs, AND no prompt-cache activity. Pure cache hits
+	// (cache_read>0 or cache_creation>0 with zero input/output) must still be
+	// recorded for accurate quota accounting.
+	if !shouldRecordUsage(inputTokens, outputTokens, result.CacheReadTokens, result.CacheCreationTokens, recordZeroToken, hasToolCosts) {
+		b.logger.Warn("Skipping token usage record: zero tokens, no cache, no tool costs, no audit flag",
 			zap.String("agent_id", input.AgentInput.AgentID),
 			zap.String("task_id", input.TaskID),
 		)

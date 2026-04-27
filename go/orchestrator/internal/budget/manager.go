@@ -54,6 +54,10 @@ type BudgetTokenUsage struct {
 	CacheReadTokens     int                    `json:"cache_read_tokens,omitempty"`
 	CacheCreationTokens   int                    `json:"cache_creation_tokens,omitempty"`
 	CacheCreation1hTokens int                    `json:"cache_creation_1h_tokens,omitempty"`
+	// CacheAwareTotalTokens = InputTokens + OutputTokens + CacheReadTokens + CacheCreationTokens.
+	// Parallel to TotalTokens (= input + output), used for quota accounting that
+	// must include prompt-cache cost while keeping TotalTokens OpenAI-compatible.
+	CacheAwareTotalTokens int                    `json:"cache_aware_total_tokens,omitempty"`
 	CallSequence        int                    `json:"call_sequence,omitempty"`
 	CostUSD             float64                `json:"cost_usd"`
 	CostOverride        float64                `json:"cost_override,omitempty"` // When > 0, use this instead of pricing calculation (e.g. Python-reported cost_usd)
@@ -326,6 +330,8 @@ func (bm *BudgetManager) RecordUsage(ctx context.Context, usage *BudgetTokenUsag
 
 	usage.Timestamp = time.Now()
 	usage.TotalTokens = usage.InputTokens + usage.OutputTokens
+	usage.CacheAwareTotalTokens = usage.InputTokens + usage.OutputTokens +
+		usage.CacheReadTokens + usage.CacheCreationTokens
 
 	// Calculate cost: prefer upstream-reported cost (e.g. Python LLM call) over pricing lookup
 	if usage.CostOverride > 0 {
@@ -337,17 +343,21 @@ func (bm *BudgetManager) RecordUsage(ctx context.Context, usage *BudgetTokenUsag
 		)
 	}
 
-	// Update in-memory budgets with overflow checks
+	// Update in-memory budgets with overflow checks. Use CacheAwareTotalTokens
+	// (= input + output + cache_read + cache_creation) so subsequent
+	// CheckBudget / backpressure / circuit-breaker see the true cost,
+	// including prompt cache. Without this, cache-heavy sessions silently
+	// blow past their quota.
 	const maxInt = int(^uint(0) >> 1)
 	bm.mu.Lock()
 	if sessionBudget, ok := bm.sessionBudgets[usage.SessionID]; ok {
-		if sessionBudget.TaskTokensUsed > maxInt-usage.TotalTokens ||
-			sessionBudget.SessionTokensUsed > maxInt-usage.TotalTokens {
+		if sessionBudget.TaskTokensUsed > maxInt-usage.CacheAwareTotalTokens ||
+			sessionBudget.SessionTokensUsed > maxInt-usage.CacheAwareTotalTokens {
 			bm.mu.Unlock()
 			return ErrTokenOverflow
 		}
-		sessionBudget.TaskTokensUsed += usage.TotalTokens
-		sessionBudget.SessionTokensUsed += usage.TotalTokens
+		sessionBudget.TaskTokensUsed += usage.CacheAwareTotalTokens
+		sessionBudget.SessionTokensUsed += usage.CacheAwareTotalTokens
 		sessionBudget.ActualCostUSD += usage.CostUSD
 	}
 	// Daily/monthly user budget tracking removed
@@ -398,6 +408,7 @@ func (bm *BudgetManager) GetUsageReport(ctx context.Context, filters UsageFilter
 		       SUM(tu.prompt_tokens) as input_total,
 		       SUM(tu.completion_tokens) as output_total,
 		       SUM(tu.total_tokens) as total_tokens,
+		       SUM(tu.cache_aware_total_tokens) as cache_aware_total_tokens,
 		       SUM(tu.cost_usd) as total_cost,
 		       COUNT(*) as request_count
 		FROM token_usage tu
@@ -415,6 +426,7 @@ func (bm *BudgetManager) GetUsageReport(ctx context.Context, filters UsageFilter
 	defer rows.Close()
 
 	var totalTokens int
+	var cacheAwareTotalTokens int
 	var totalCost float64
 
 	for rows.Next() {
@@ -423,6 +435,7 @@ func (bm *BudgetManager) GetUsageReport(ctx context.Context, filters UsageFilter
 			&detail.UserID, &detail.TaskID,
 			&detail.Model, &detail.Provider,
 			&detail.InputTokens, &detail.OutputTokens, &detail.TotalTokens,
+			&detail.CacheAwareTotalTokens,
 			&detail.CostUSD, &detail.RequestCount,
 		)
 		if err != nil {
@@ -431,6 +444,7 @@ func (bm *BudgetManager) GetUsageReport(ctx context.Context, filters UsageFilter
 
 		report.Details = append(report.Details, detail)
 		totalTokens += detail.TotalTokens
+		cacheAwareTotalTokens += detail.CacheAwareTotalTokens
 		totalCost += detail.CostUSD
 
 		// Update model breakdown
@@ -440,12 +454,14 @@ func (bm *BudgetManager) GetUsageReport(ctx context.Context, filters UsageFilter
 		modelKey := fmt.Sprintf("%s:%s", detail.Provider, detail.Model)
 		mb := report.ModelBreakdown[modelKey]
 		mb.Tokens += detail.TotalTokens
+		mb.CacheAwareTokens += detail.CacheAwareTotalTokens
 		mb.Cost += detail.CostUSD
 		mb.Requests += detail.RequestCount
 		report.ModelBreakdown[modelKey] = mb
 	}
 
 	report.TotalTokens = totalTokens
+	report.CacheAwareTotalTokens = cacheAwareTotalTokens
 	report.TotalCostUSD = totalCost
 
 	return report, nil
@@ -604,11 +620,11 @@ func (bm *BudgetManager) storeUsage(ctx context.Context, usage *BudgetTokenUsage
 		INSERT INTO token_usage (
 			user_id, task_id, agent_id, provider, model,
 			prompt_tokens, completion_tokens, total_tokens, cost_usd,
-			cache_read_tokens, cache_creation_tokens, call_sequence
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			cache_read_tokens, cache_creation_tokens, cache_aware_total_tokens, call_sequence
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 	`, userUUID, taskUUID, usage.AgentID, usage.Provider, usage.Model,
 		usage.InputTokens, usage.OutputTokens, usage.TotalTokens, usage.CostUSD,
-		usage.CacheReadTokens, usage.CacheCreationTokens, usage.CallSequence)
+		usage.CacheReadTokens, usage.CacheCreationTokens, usage.CacheAwareTotalTokens, usage.CallSequence)
 
 	if err != nil {
 		bm.logger.Error("Failed to store token usage", zap.Error(err))
@@ -649,33 +665,38 @@ type UsageFilters struct {
 }
 
 type UsageReport struct {
-	StartTime      time.Time             `json:"start_time"`
-	EndTime        time.Time             `json:"end_time"`
-	TotalTokens    int                   `json:"total_tokens"`
-	TotalCostUSD   float64               `json:"total_cost_usd"`
-	Details        []UsageDetail         `json:"details"`
-	ModelBreakdown map[string]ModelUsage `json:"model_breakdown"`
+	StartTime time.Time `json:"start_time"`
+	EndTime   time.Time `json:"end_time"`
+	// TotalTokens is OpenAI-compatible (= prompt + completion). For
+	// quota/billing use CacheAwareTotalTokens, which adds cache classes.
+	TotalTokens           int                   `json:"total_tokens"`
+	CacheAwareTotalTokens int                   `json:"cache_aware_total_tokens"`
+	TotalCostUSD          float64               `json:"total_cost_usd"`
+	Details               []UsageDetail         `json:"details"`
+	ModelBreakdown        map[string]ModelUsage `json:"model_breakdown"`
 }
 
 type UsageDetail struct {
-	UserID       string  `json:"user_id"`
-	SessionID    string  `json:"session_id"`
-	TaskID       string  `json:"task_id"`
-	Model        string  `json:"model"`
-	Provider     string  `json:"provider"`
-	InputTokens  int     `json:"input_tokens"`
-	OutputTokens int     `json:"output_tokens"`
-	TotalTokens  int     `json:"total_tokens"`
-	CostUSD      float64 `json:"cost_usd"`
-	RequestCount int     `json:"request_count"`
+	UserID                string  `json:"user_id"`
+	SessionID             string  `json:"session_id"`
+	TaskID                string  `json:"task_id"`
+	Model                 string  `json:"model"`
+	Provider              string  `json:"provider"`
+	InputTokens           int     `json:"input_tokens"`
+	OutputTokens          int     `json:"output_tokens"`
+	TotalTokens           int     `json:"total_tokens"`
+	CacheAwareTotalTokens int     `json:"cache_aware_total_tokens"`
+	CostUSD               float64 `json:"cost_usd"`
+	RequestCount          int     `json:"request_count"`
 }
 
 type ModelUsage struct {
-	Tokens              int     `json:"tokens"`
-	Cost                float64 `json:"cost"`
-	Requests            int     `json:"requests"`
-	CacheReadTokens     int     `json:"cache_read_tokens,omitempty"`
-	CacheCreationTokens int     `json:"cache_creation_tokens,omitempty"`
+	Tokens                int     `json:"tokens"`
+	CacheAwareTokens      int     `json:"cache_aware_tokens,omitempty"`
+	Cost                  float64 `json:"cost"`
+	Requests              int     `json:"requests"`
+	CacheReadTokens       int     `json:"cache_read_tokens,omitempty"`
+	CacheCreationTokens   int     `json:"cache_creation_tokens,omitempty"`
 }
 
 // Enhanced Budget Manager Features - Backpressure and Circuit Breaker

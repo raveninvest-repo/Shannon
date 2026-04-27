@@ -70,6 +70,7 @@ func TestRecordUsage_ExecInsertsTokenUsage(t *testing.T) {
 		sqlmock.AnyArg(), sqlmock.AnyArg(), usage.AgentID, usage.Provider, usage.Model,
 		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(), // cache_read_tokens, cache_creation_tokens
+		sqlmock.AnyArg(),                   // cache_aware_total_tokens
 		sqlmock.AnyArg(),                   // call_sequence
 	).WillReturnResult(sqlmock.NewResult(1, 1))
 
@@ -90,8 +91,8 @@ func TestGetUsageReport_AggregatesRows(t *testing.T) {
 
 	bm := NewBudgetManager(db, zap.NewNop())
 
-	rows := sqlmock.NewRows([]string{"user_id", "task_id", "model", "provider", "input_total", "output_total", "total_tokens", "total_cost", "request_count"}).
-		AddRow("u1", "t1", "gpt-5-nano-2025-08-07", "openai", 30, 60, 90, 0.1, 2)
+	rows := sqlmock.NewRows([]string{"user_id", "task_id", "model", "provider", "input_total", "output_total", "total_tokens", "cache_aware_total_tokens", "total_cost", "request_count"}).
+		AddRow("u1", "t1", "gpt-5-nano-2025-08-07", "openai", 30, 60, 90, 90, 0.1, 2)
 
 	mock.ExpectQuery(`SELECT\s+tu\.user_id,.*FROM\s+token_usage`).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
@@ -169,6 +170,74 @@ func TestRecordUsage_NoCostOverrideFallsToPricing(t *testing.T) {
 	// CostUSD should be calculated via pricing, not zero
 	if usage.CostUSD <= 0 {
 		t.Fatalf("expected CostUSD > 0 from pricing calculation, got %f", usage.CostUSD)
+	}
+}
+
+// CheckBudget reads sessionBudget.SessionTokensUsed; that counter must
+// be incremented by the cache-aware total so cache-heavy sessions
+// don't silently overrun their quota.
+func TestRecordUsage_BudgetCounterUsesCacheAware(t *testing.T) {
+	bm := NewBudgetManager(nil, zap.NewNop())
+	bm.SetSessionBudget("sess-budget", &TokenBudget{
+		TaskBudget:    100000,
+		SessionBudget: 100000,
+	})
+
+	usage := &BudgetTokenUsage{
+		UserID:              "u1",
+		SessionID:           "sess-budget",
+		Model:               "claude-sonnet-4-5-20250929",
+		Provider:            "anthropic",
+		InputTokens:         100,
+		OutputTokens:        50,
+		CacheReadTokens:     500,
+		CacheCreationTokens: 200,
+	}
+	if err := bm.RecordUsage(context.Background(), usage); err != nil {
+		t.Fatalf("RecordUsage error: %v", err)
+	}
+
+	bm.mu.RLock()
+	sb := bm.sessionBudgets["sess-budget"]
+	bm.mu.RUnlock()
+
+	// Quota counter must include cache classes (= 100 + 50 + 500 + 200 = 850)
+	if got, want := sb.SessionTokensUsed, 850; got != want {
+		t.Errorf("SessionTokensUsed = %d, want %d (cache-aware total)", got, want)
+	}
+	if got, want := sb.TaskTokensUsed, 850; got != want {
+		t.Errorf("TaskTokensUsed = %d, want %d (cache-aware total)", got, want)
+	}
+}
+
+func TestRecordUsage_CacheAwareTotalInvariant(t *testing.T) {
+	bm := NewBudgetManager(nil, zap.NewNop())
+	bm.SetSessionBudget("sess-cache", &TokenBudget{
+		TaskBudget:    100000,
+		SessionBudget: 100000,
+	})
+
+	usage := &BudgetTokenUsage{
+		UserID:              "u1",
+		SessionID:           "sess-cache",
+		Model:               "claude-sonnet-4-5-20250929",
+		Provider:            "anthropic",
+		InputTokens:         100,
+		OutputTokens:        50,
+		CacheReadTokens:     500,
+		CacheCreationTokens: 200,
+	}
+	if err := bm.RecordUsage(context.Background(), usage); err != nil {
+		t.Fatalf("RecordUsage error: %v", err)
+	}
+
+	// total_tokens stays input + output (OpenAI compatible)
+	if got, want := usage.TotalTokens, 150; got != want {
+		t.Errorf("TotalTokens = %d, want %d (input+output, OpenAI compat)", got, want)
+	}
+	// cache_aware_total_tokens adds cache classes
+	if got, want := usage.CacheAwareTotalTokens, 850; got != want {
+		t.Errorf("CacheAwareTotalTokens = %d, want %d (input+output+cache_read+cache_creation)", got, want)
 	}
 }
 
