@@ -10,9 +10,22 @@
 #   - Per-row mismatch counts (token_usage, task_executions)
 #   - Cache leak recovered (true_total - old_total over token_usage)
 #
+# Environments:
+#   - Local docker compose (default):
+#       ./scripts/verify_cache_quota_invariant.sh
+#   - EKS / k8s with kubectl-run psql pod:
+#       PSQL_CMD="kubectl exec -i postgres-client -- psql -U shannon -d shannon -t -A" \
+#         ./scripts/verify_cache_quota_invariant.sh
+#   - Any direct psql client (RDS, port-forward, etc.):
+#       PSQL_CMD="psql postgresql://user:pass@host/shannon -t -A" \
+#         ./scripts/verify_cache_quota_invariant.sh
+#
 set -euo pipefail
 
-PSQL=(docker exec shannon-postgres-1 psql -U shannon -d shannon -t -A)
+# PSQL_CMD lets the caller swap the docker-compose default for an EKS/RDS
+# kubectl invocation. We use `read -ra` to keep flags as separate argv tokens.
+DEFAULT_PSQL="docker exec shannon-postgres-1 psql -U shannon -d shannon -t -A"
+read -ra PSQL <<< "${PSQL_CMD:-$DEFAULT_PSQL}"
 
 echo "=== Per-row invariant check (token_usage) ==="
 "${PSQL[@]}" -c "
