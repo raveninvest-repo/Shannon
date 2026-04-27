@@ -1828,6 +1828,18 @@ func SwarmWorkflow(ctx workflow.Context, input TaskInput) (TaskResult, error) {
 	maxTokens := cfg.SwarmMaxTotalTokens
 	maxWallClockSeconds := cfg.SwarmMaxWallClockMinutes * 60
 	swarmStartTime := workflow.Now(ctx)
+
+	// Cache-aware budget accounting (v1+): include prompt-cache tokens in
+	// budgetTotalTokens so SwarmMaxTotalTokens hard gate at L2780 enforces
+	// the true token cost. Pre-version replay paths keep the old cache-blind
+	// math to preserve workflow determinism.
+	swarmCacheAwareBudgetV := workflow.GetVersion(ctx, "swarm_cache_aware_budget_v1", workflow.DefaultVersion, 1)
+	cacheAwareBudget := func(tokens, cacheRead, cacheCreation int) int {
+		if swarmCacheAwareBudgetV >= 1 {
+			return tokens + cacheRead + cacheCreation
+		}
+		return tokens
+	}
 	var elapsed int // declared here so it can be updated per-iteration and in file_read inner loop
 
 	type agentFuture struct {
@@ -1921,7 +1933,7 @@ func SwarmWorkflow(ctx workflow.Context, input TaskInput) (TaskResult, error) {
 		}
 
 		budgetTotalLLMCalls++
-		budgetTotalTokens += planDecision.TokensUsed
+		budgetTotalTokens += cacheAwareBudget(planDecision.TokensUsed, planDecision.CacheReadTokens, planDecision.CacheCreationTokens)
 
 		// Record Lead token usage
 		{
@@ -2558,7 +2570,7 @@ func SwarmWorkflow(ctx workflow.Context, input TaskInput) (TaskResult, error) {
 			// Tool execution tokens (web_search results, etc.) are NOT counted here
 			// because they're processed by agent-core, not the LLM service.
 			budgetTotalLLMCalls += result.Iterations
-			budgetTotalTokens += result.TokensUsed
+			budgetTotalTokens += cacheAwareBudget(result.TokensUsed, result.CacheReadTokens, result.CacheCreationTokens)
 			// Note: per-step LLM tokens and per-tool Haiku tokens are already recorded
 			// inside AgentLoop (agent_step + tool_exec phases). No aggregate recording
 			// here to avoid double-counting.
@@ -2974,7 +2986,7 @@ func SwarmWorkflow(ctx workflow.Context, input TaskInput) (TaskResult, error) {
 
 			// Track Lead decision in history
 			budgetTotalLLMCalls++
-			budgetTotalTokens += decision.TokensUsed
+			budgetTotalTokens += cacheAwareBudget(decision.TokensUsed, decision.CacheReadTokens, decision.CacheCreationTokens)
 
 			// Record Lead decision token usage
 			{
@@ -3773,7 +3785,7 @@ synthesis:
 		}
 
 		budgetTotalLLMCalls++
-		budgetTotalTokens += closingDecision.TokensUsed
+		budgetTotalTokens += cacheAwareBudget(closingDecision.TokensUsed, closingDecision.CacheReadTokens, closingDecision.CacheCreationTokens)
 
 		// Record Lead closing decision token usage
 		{

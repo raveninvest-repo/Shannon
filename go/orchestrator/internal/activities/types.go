@@ -220,8 +220,14 @@ type SessionUpdateInput struct {
 	SessionID  string
 	Result     string
 	TokensUsed int
-	AgentsUsed int
-	CostUSD    float64
+	// Optional: cache-aware token total (= input + output + cache_read +
+	// cache_creation). When > 0, UpdateSessionResult prefers this for
+	// session.TotalTokensUsed and pricing so cache cost is reflected in
+	// the running session counter and cost. Cache-blind callers can leave
+	// this zero; the activity will fall back to TokensUsed.
+	CacheAwareTokensUsed int
+	AgentsUsed           int
+	CostUSD              float64
 	// Optional: model used for this update when single-model
 	ModelUsed string
 	// Optional: per-agent usage for accurate cost across multiple models
@@ -236,10 +242,14 @@ type SessionUpdateResult struct {
 
 // AgentUsage captures model-specific token usage for cost calculation
 type AgentUsage struct {
-	Model        string `json:"model"`
-	Tokens       int    `json:"tokens"`
-	InputTokens  int    `json:"input_tokens,omitempty"`
-	OutputTokens int    `json:"output_tokens,omitempty"`
+	Model                 string `json:"model"`
+	Provider              string `json:"provider,omitempty"`
+	Tokens                int    `json:"tokens"`
+	InputTokens           int    `json:"input_tokens,omitempty"`
+	OutputTokens          int    `json:"output_tokens,omitempty"`
+	CacheReadTokens       int    `json:"cache_read_tokens,omitempty"`
+	CacheCreationTokens   int    `json:"cache_creation_tokens,omitempty"`
+	CacheCreation1hTokens int    `json:"cache_creation_1h_tokens,omitempty"`
 }
 
 // ── HITL Research Review Types ──

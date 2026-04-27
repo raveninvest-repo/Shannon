@@ -39,28 +39,30 @@ func (a *Activities) UpdateSessionResult(ctx context.Context, input SessionUpdat
 		}, err
 	}
 
-	// Update token usage and cost (centralized pricing; prefer per-agent, then model, then default)
+	// Update token usage and cost (centralized pricing; prefer per-agent, then model, then default).
+	// When AgentUsage carries cache_read / cache_creation, use CostForSplitWithCache so the
+	// computed cost reflects prompt-cache discount/premium pricing.
 	costUSD := input.CostUSD
 	if costUSD <= 0 {
 		if len(input.AgentUsage) > 0 {
 			var total float64
 			for _, au := range input.AgentUsage {
-				if au.Model == "" {
-					if au.InputTokens > 0 || au.OutputTokens > 0 {
-						total += pricing.CostForSplit("", au.InputTokens, au.OutputTokens)
-					} else {
-						total += pricing.CostForTokens("", au.Tokens)
-					}
+				model := au.Model
+				if model == "" {
 					a.logger.Warn("Pricing fallback used (missing model)", zap.Int("tokens", au.Tokens))
-					continue
+				} else if _, ok := pricing.PricePerTokenForModel(model); !ok {
+					a.logger.Warn("Pricing model not found; using default", zap.String("model", model), zap.Int("tokens", au.Tokens))
 				}
-				if _, ok := pricing.PricePerTokenForModel(au.Model); !ok {
-					a.logger.Warn("Pricing model not found; using default", zap.String("model", au.Model), zap.Int("tokens", au.Tokens))
-				}
-				if au.InputTokens > 0 || au.OutputTokens > 0 {
-					total += pricing.CostForSplit(au.Model, au.InputTokens, au.OutputTokens)
-				} else {
-					total += pricing.CostForTokens(au.Model, au.Tokens)
+				switch {
+				case au.CacheReadTokens > 0 || au.CacheCreationTokens > 0 || au.CacheCreation1hTokens > 0:
+					total += pricing.CostForSplitWithCache(
+						model, au.InputTokens, au.OutputTokens,
+						au.CacheReadTokens, au.CacheCreationTokens, au.CacheCreation1hTokens, au.Provider,
+					)
+				case au.InputTokens > 0 || au.OutputTokens > 0:
+					total += pricing.CostForSplit(model, au.InputTokens, au.OutputTokens)
+				default:
+					total += pricing.CostForTokens(model, au.Tokens)
 				}
 			}
 			costUSD = total
@@ -68,12 +70,38 @@ func (a *Activities) UpdateSessionResult(ctx context.Context, input SessionUpdat
 			if _, ok := pricing.PricePerTokenForModel(input.ModelUsed); !ok {
 				a.logger.Warn("Pricing model not found; using default", zap.String("model", input.ModelUsed), zap.Int("tokens", input.TokensUsed))
 			}
-			costUSD = pricing.CostForTokens(input.ModelUsed, input.TokensUsed)
+			// When CacheAwareTokensUsed is set, price the cache-inclusive total
+			// so the model-only fallback doesn't undercount prompt-cache cost.
+			tokensForPricing := input.TokensUsed
+			if input.CacheAwareTokensUsed > tokensForPricing {
+				tokensForPricing = input.CacheAwareTokensUsed
+			}
+			costUSD = pricing.CostForTokens(input.ModelUsed, tokensForPricing)
 		} else {
-			costUSD = float64(input.TokensUsed) * pricing.DefaultPerToken()
+			tokensForPricing := input.TokensUsed
+			if input.CacheAwareTokensUsed > tokensForPricing {
+				tokensForPricing = input.CacheAwareTokensUsed
+			}
+			costUSD = float64(tokensForPricing) * pricing.DefaultPerToken()
 		}
 	}
-	sess.UpdateTokenUsage(input.TokensUsed, costUSD)
+
+	// Prefer cache-aware token total for the session counter so prompt-cache
+	// cost shows up in session.TotalTokensUsed and downstream context fields.
+	tokensForSession := input.TokensUsed
+	if input.CacheAwareTokensUsed > tokensForSession {
+		tokensForSession = input.CacheAwareTokensUsed
+	} else if len(input.AgentUsage) > 0 {
+		// Derive cache-aware total from AgentUsage when caller didn't precompute it.
+		var derived int
+		for _, au := range input.AgentUsage {
+			derived += au.InputTokens + au.OutputTokens + au.CacheReadTokens + au.CacheCreationTokens
+		}
+		if derived > tokensForSession {
+			tokensForSession = derived
+		}
+	}
+	sess.UpdateTokenUsage(tokensForSession, costUSD)
 
 	// Record metrics
 	metrics.RecordSessionTokens(input.TokensUsed)

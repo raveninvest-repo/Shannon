@@ -6368,23 +6368,32 @@ func ResearchWorkflow(ctx workflow.Context, input TaskInput) (TaskResult, error)
 
 	// Step 5: Update session and persist results (Moved here to use accurate cost/token data)
 	if input.SessionID != "" {
-		// Use report values if available, otherwise fallback to local estimates
+		// Use report values if available, otherwise fallback to local estimates.
+		// TokensUsed keeps OpenAI-shaped (input + output) semantics for any
+		// downstream consumer that compares against API responses;
+		// CacheAwareTokensUsed carries the true total (incl. prompt cache)
+		// for the session quota counter and pricing.
 		finalCost := estCost
 		finalTokens := totalTokens
+		var finalCacheAware int
 		if report != nil {
 			finalCost = report.TotalCostUSD
-			finalTokens = report.TotalTokens
+			if report.TotalTokens > 0 {
+				finalTokens = report.TotalTokens
+			}
+			finalCacheAware = report.CacheAwareTotalTokens
 		}
 
 		var updRes activities.SessionUpdateResult
 		err = workflow.ExecuteActivity(ctx,
 			constants.UpdateSessionResultActivity,
 			activities.SessionUpdateInput{
-				SessionID:  input.SessionID,
-				Result:     finalResult,
-				TokensUsed: finalTokens,
-				AgentsUsed: len(agentResults),
-				CostUSD:    finalCost, // Pass explicit cost to avoid default fallback
+				SessionID:            input.SessionID,
+				Result:               finalResult,
+				TokensUsed:           finalTokens,
+				CacheAwareTokensUsed: finalCacheAware,
+				AgentsUsed:           len(agentResults),
+				CostUSD:              finalCost, // Pass explicit cost to avoid default fallback
 			}).Get(ctx, &updRes)
 		if err != nil {
 			logger.Error("Failed to update session", "error", err)
